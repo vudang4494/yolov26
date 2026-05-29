@@ -13,7 +13,7 @@ class YOLOv26Backbone(nn.Module):
         Stage1: c1 -> c2 (stride 2) -> 160x160
         Stage2: c2 -> c3 (stride 2) -> 80x80   (P3)
         Stage3: c3 -> c4 (stride 2) -> 40x40   (P4)
-        Stage4: c4 -> c5 (stride 2) -> 20x20   (P5)
+        Stage4: c4 -> c5 (stride 2) -> 20x20   (P5 + SPPF)
     """
 
     def __init__(self, in_ch=3, channels=(64, 128, 256, 512, 1024),
@@ -47,8 +47,8 @@ class YOLOv26Backbone(nn.Module):
         self.out_chs = (c3, c4, c5)
 
     def forward(self, x):
-        x = self.stem(x)      # 320x320
-        p2 = self.stage1(x)   # 160x160
+        x = self.stem(x)       # 320x320
+        p2 = self.stage1(x)    # 160x160
         p3 = self.stage2(p2)  # 80x80  -> P3
         p4 = self.stage3(p3)  # 40x40  -> P4
         p5 = self.stage4(p4)  # 20x20  -> P5

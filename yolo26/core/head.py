@@ -20,7 +20,7 @@ class YOLOv26Head(nn.Module):
         super().__init__()
         self.nc = num_classes
         self.reg_max = reg_max
-        self.stride = torch.tensor([8, 16, 32])
+        self.register_buffer("stride", torch.tensor([8, 16, 32], dtype=torch.float32))
 
         # O2M Branch — 2 Conv layers
         self.o2m_cls = nn.Sequential(

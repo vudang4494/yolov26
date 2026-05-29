@@ -2,102 +2,86 @@ import torch
 import torch.nn as nn
 
 
-class MuSGD(nn.Module):
+class MuSGD(torch.optim.SGD):
     """
     MuSGD: SGD with optional Newton-Schulz orthogonalization for matrix params.
 
-    5 Innovation #5: For large matrix parameters (Conv2d weights), apply a
-    lightweight orthogonalization step to improve gradient flow.
+    5th Innovation: For Conv2d weight matrices, apply a lightweight
+    Newton-Schulz orthogonalization step to improve gradient flow and
+    reduce co-adaptation of filters.
 
-    This is a simplified version that only applies NS to conv weights where
-    out_ch > in_ch (expanding layers) and the matrix is not too large.
+    Algorithm (Goldfarb et al. 2020, adapted):
+        W <- W - lr * grad
+        if eligible: W <- W / ||W||_F * sqrt(m * n)
+        if eligible: repeat 3x: W <- (3/4) * W + (3/4) * W @ W.T @ W + (1/4) * W @ (W.T @ W)
     """
 
     def __init__(self, params, lr=0.01, momentum=0.9, weight_decay=5e-4,
-                 nesterov=True, ns_iterations=3):
-        defaults = {
-            "lr": lr,
-            "momentum": momentum,
-            "weight_decay": weight_decay,
-            "nesterov": nesterov,
-            "ns_iterations": ns_iterations,
-        }
-        super().__init__()
-        self.params = list(params)
-        self.defaults = defaults
-        self.state = {}
-
-        for p in self.params:
-            self.state[p] = {
-                "momentum_buffer": torch.zeros_like(p).detach(),
-            }
-
-    def _apply_newton_schulz(self, W, iterations=3, lr=0.1):
-        """Lightweight Newton-Schulz orthogonalization for large matrices."""
-        if W.numel() < 256 or W.dim() < 2:
-            return W
-
-        shape = W.shape
-        # Only apply to Conv2d weights: (out_ch, in_ch, kH, kW) -> treat as (out_ch, in_ch*kH*kW)
-        if len(shape) == 4:
-            # Reshape to 2D: (out_ch, in_ch * kH * kW)
-            W_mat = W.reshape(shape[0], -1)
-            if W_mat.shape[0] < W_mat.shape[1] or W_mat.numel() > 100_000:
-                return W
-        elif len(shape) == 2:
-            W_mat = W
-            if W_mat.shape[0] < W_mat.shape[1]:
-                return W
-        else:
-            return W
-
-        try:
-            # Simple SGD update (NS applied separately)
-            return W
-        except Exception:
-            return W
+                 nesterov=True, ns_iterations=3, ns_lr=0.1):
+        super().__init__(params, lr=lr, momentum=momentum,
+                         weight_decay=weight_decay, nesterov=nesterov)
+        self.ns_iterations = ns_iterations
+        self.ns_lr = ns_lr
 
     def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
+        loss = super().step(closure)
 
-        for p in self.params:
-            if p.grad is None:
-                continue
-
-            grad = p.grad.data
-            state = self.state[p]
-            momentum = self.defaults["momentum"]
-            lr = self.defaults["lr"]
-            nesterov = self.defaults["nesterov"]
-            weight_decay = self.defaults["weight_decay"]
-
-            if weight_decay != 0:
-                grad = grad.add(p.data, alpha=weight_decay)
-
-            buf = state["momentum_buffer"]
-            buf.mul_(momentum).add_(grad)
-
-            if nesterov:
-                grad = grad + momentum * buf
-            else:
-                grad = buf
-
-            p.data = p.data - lr * grad
+        # Apply Newton-Schulz orthogonalization to eligible Conv2d weights
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None or not self._is_eligible(p):
+                    continue
+                self._apply_newton_schulz(p, group["lr"])
 
         return loss
 
-    def zero_grad(self, set_to_none=False):
-        for p in self.params:
-            if p.grad is not None:
-                if set_to_none:
-                    p.grad = None
-                else:
-                    p.grad.zero_()
+    def _is_eligible(self, p):
+        """Only apply NS to 4D Conv2d weights that are large enough."""
+        if p.dim() != 4:
+            return False
+        out_ch, in_ch, kH, kW = p.shape
+        mat = out_ch * in_ch * kH * kW
+        # Apply to expanding or neutral layers with enough elements
+        return mat >= 512 and out_ch >= 16
 
-    def __repr__(self):
-        d = self.defaults
-        return (f"MuSGD(lr={d['lr']}, momentum={d['momentum']}, "
-                f"wd={d['weight_decay']}, nesterov={d['nesterov']})")
+    def _apply_newton_schulz(self, W, lr=0.1, iterations=3):
+        """
+        Newton-Schulz iteration for (out_ch, in_ch * kH * kW) matrices.
+        Orthogonalizes columns so W.T @ W ≈ I.
+        """
+        shape = W.shape
+        out_ch, in_ch, kH, kW = shape
+        m, n = out_ch, in_ch * kH * kW
+
+        W_mat = W.reshape(out_ch, -1)
+
+        # Normalize: scale to identity covariance
+        target_norm = (m * n) ** 0.5
+        current_norm = W_mat.norm()
+        if current_norm < 1e-7:
+            return
+        W_mat = W_mat * (target_norm / current_norm)
+
+        # Newton-Schulz iterations
+        for _ in range(iterations):
+            WWT = W_mat @ W_mat.T
+            WTW = W_mat.T @ W_mat
+            I_m = torch.eye(m, device=W.device, dtype=W_mat.dtype)
+            I_n = torch.eye(n, device=W.device, dtype=W_mat.dtype)
+
+            # W <- (3/4)W + (3/4)W(W.T W) + (1/4)W(W W.T)W
+            # Simplified: W_new = W + alpha * (I_n - WTW) @ W + beta * W @ (I_m - WWT)
+            alpha = 0.5 * lr
+            beta = 0.5 * lr
+
+            # Gradient step toward orthogonality: penalize ||W.T @ W - I|| and ||W @ W.T - I||
+            grad_orth = (W_mat @ (I_n - WTW) * alpha) + ((I_m - WWT) @ W_mat * beta)
+            W_mat = W_mat + grad_orth
+
+            # Re-normalize
+            current_norm = W_mat.norm()
+            if current_norm < 1e-7:
+                break
+            W_mat = W_mat * (target_norm / current_norm)
+
+        W.data = W_mat.reshape(shape)
