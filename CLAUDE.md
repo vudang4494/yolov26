@@ -1,5 +1,9 @@
 # CLAUDE.md — YOLOv26 Pure PyTorch Implementation
 
+> **Agent System:** This project has a full agent system configured in `AGENTS.md`.
+> Always read `AGENTS.md` first for skill routing, then read the relevant skill.
+> 31 skills available across YOLOv26, HuggingFace, Vision Training, Gradio, Canvas, and more.
+
 ## Project Overview
 
 **YOLOv26** là implementation thuần PyTorch của mô hình object detection với 5 innovations:
