@@ -55,22 +55,19 @@ class PostProcess:
 
             # anchors_lvl: (n, 4) = [cx_norm, cy_norm, w_norm, h_norm] normalized to [0,1]
             anchor_flat = anchors_lvl.to(device).reshape(1, -1, 4)
-            # Stride for this level (stride tensor was list, convert to proper stride)
-            stride_vals = torch.tensor(strides, device=device, dtype=torch.float32)
-            stride_for_level = stride_vals[level_idx]
-            stride_tensor = stride_for_level.view(1, 1, 1)  # (1,1,1)
+            stride_for_level = strides[level_idx]
+            stride_tensor = torch.tensor(stride_for_level, device=device, dtype=torch.float32).view(1, 1, 1)
 
             # Anchor centers in absolute pixels
-            anchor_cx_px = anchor_flat[..., 0:1] * image_size  # [0,1] -> [0, img_size]
+            anchor_cx_px = anchor_flat[..., 0:1] * image_size
             anchor_cy_px = anchor_flat[..., 1:2] * image_size
             anchor_w_px = anchor_flat[..., 2:3] * image_size
             anchor_h_px = anchor_flat[..., 3:4] * image_size
 
             # Decode: absolute = anchor + reg * stride
-            # reg_flat: (B, n, 4) in normalized coords, multiply by stride to get pixels
-            dx_px = reg_flat[..., 0:1] * stride_tensor  # in pixels
+            dx_px = reg_flat[..., 0:1] * stride_tensor
             dy_px = reg_flat[..., 1:2] * stride_tensor
-            dw_px = reg_flat[..., 2:3] * stride_tensor  # log-scale in pixels
+            dw_px = reg_flat[..., 2:3] * stride_tensor
             dh_px = reg_flat[..., 3:4] * stride_tensor
 
             cx_px = anchor_cx_px + dx_px

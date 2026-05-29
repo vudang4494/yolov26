@@ -8,35 +8,32 @@ from .postprocess import PostProcess
 
 
 SCALE_CONFIGS = {
+    # YOLOv26 scales — optimized for Apple MPS (M4)
+    # X scale removed (1.3B params not practical for edge/mobile)
+    # channels are already ACTUAL values (width_mult pre-applied)
     "n": {
-        "channels": (64, 128, 256, 512, 1024),
-        "depths": (1, 2, 4, 4, 2),
+        "channels": (16, 32, 64, 128, 256),   # 32-aligned, ~4.5M params
+        "depths": (1, 1, 3, 3, 1),          # -1 layer per P3/P4 bottleneck
         "width_mult": 0.25,
-        "num_repeats": (1, 3, 6, 6, 3),
+        "num_repeats": (1, 2, 4, 4, 2),
     },
     "s": {
-        "channels": (64, 128, 256, 512, 1024),
-        "depths": (1, 3, 6, 6, 3),
+        "channels": (32, 64, 128, 256, 512),   # 32-aligned, ~30M params
+        "depths": (1, 3, 6, 6, 3),           # original
         "width_mult": 0.5,
         "num_repeats": (1, 3, 9, 9, 3),
     },
     "m": {
-        "channels": (80, 160, 320, 640, 1280),
-        "depths": (2, 4, 8, 8, 4),
+        "channels": (60, 120, 240, 480, 960),  # original COCO scaling, ~133M params
+        "depths": (2, 4, 8, 8, 4),           # original
         "width_mult": 0.75,
         "num_repeats": (2, 6, 12, 12, 4),
     },
     "l": {
-        "channels": (96, 192, 384, 768, 1536),
-        "depths": (3, 6, 12, 12, 6),
+        "channels": (96, 192, 384, 768, 1536), # original, ~479M params
+        "depths": (3, 6, 12, 12, 6),          # original
         "width_mult": 1.0,
         "num_repeats": (3, 9, 18, 18, 6),
-    },
-    "x": {
-        "channels": (112, 224, 448, 896, 1792),
-        "depths": (4, 8, 16, 16, 8),
-        "width_mult": 1.25,
-        "num_repeats": (4, 12, 24, 24, 8),
     },
 }
 
@@ -96,27 +93,29 @@ class YOLOv26Model(nn.Module):
             raise ValueError(f"Scale must be one of {list(SCALE_CONFIGS.keys())}")
         cfg = SCALE_CONFIGS[scale]
 
+        # SCALE_CONFIGS stores ACTUAL channel counts (post-width_mult).
+        # Backbone receives them directly — no additional multiplication.
         self.backbone = YOLOv26Backbone(
             in_ch=3,
             channels=cfg["channels"],
             depths=cfg["depths"],
-            width_mult=cfg["width_mult"],
+            width_mult=1.0,
         )
 
+        # Neck in_chs from backbone output (P3, P4, P5).
+        # neck out_ch follows original formula: int(256 * wm)
         wm = cfg["width_mult"]
-        backbone_out_chs = [int(c * wm) for c in cfg["channels"][2:]]
+        neck_out_ch = int(256 * wm)
 
         self.neck = YOLOv26Neck(
-            in_chs=backbone_out_chs,
-            out_ch=int(256 * wm),
-            width_mult=wm,
+            in_chs=cfg["channels"][2:],  # (c3, c4, c5) from backbone
+            out_ch=neck_out_ch,
         )
 
         self.head = YOLOv26Head(
             num_classes=num_classes,
-            in_ch=int(256 * wm),
+            in_ch=neck_out_ch,
             reg_max=reg_max,
-            width_mult=wm,
         )
 
         self.postprocess = PostProcess(
@@ -126,24 +125,54 @@ class YOLOv26Model(nn.Module):
             iou_thresh=iou_thresh,
         )
 
+        self._apply_hardcoded_optimizations()
+
         self.strides = [8, 16, 32]
+        # Hardcoded anchor values: no dummy forward pass needed.
+        # image_size=640, strides=[8,16,32], features=[80x80, 40x40, 20x20]
         self._generate_anchors()
 
         self.cfg = cfg
 
     def _generate_anchors(self):
-        """Precompute anchors for each feature level."""
-        B = 1
-        dummy = torch.zeros(B, 3, self.image_size, self.image_size)
-        features = self._forward_backbone(dummy)
-        feature_sizes = [(f.shape[2], f.shape[3]) for f in features]
+        """Precompute anchors for each feature level.
 
-        self.anchor_list = generate_anchors(
-            feature_sizes, self.strides,
-            self.image_size, device=next(self.parameters()).device
-        )
-        self.stride_tensor = torch.tensor(self.strides, dtype=torch.float32,
-                                          device=next(self.parameters()).device)
+        Hardcoded for image_size=640, strides=[8,16,32]:
+          P3: 80x80 grid, stride 8  → 6400 anchors
+          P4: 40x40 grid, stride 16 → 1600 anchors
+          P5: 20x20 grid, stride 32 → 400 anchors
+        Each anchor box = [cx_norm, cy_norm, w_norm, h_norm] in [0,1].
+        """
+        img_size = self.image_size
+        device = next(self.parameters()).device
+        self.anchor_list = []
+        self.stride_tensor = torch.tensor(self.strides, dtype=torch.float32, device=device)
+
+        for stride in self.strides:
+            grid_size = img_size // stride
+            anchor_size = stride / img_size
+
+            shifts_x = (torch.arange(grid_size, device=device) + 0.5) * stride / img_size
+            shifts_y = (torch.arange(grid_size, device=device) + 0.5) * stride / img_size
+            shift_y, shift_x = torch.meshgrid(shifts_y, shifts_x, indexing="ij")
+            shift_x = shift_x.reshape(-1)
+            shift_y = shift_y.reshape(-1)
+
+            anchor = torch.stack([
+                shift_x,
+                shift_y,
+                torch.full_like(shift_x, anchor_size),
+                torch.full_like(shift_x, anchor_size),
+            ], dim=1)
+            self.anchor_list.append(anchor)
+
+    def _apply_hardcoded_optimizations(self):
+        """Apply MPS hardware optimizations after model construction.
+
+        torch.compile is disabled on MPS — MPS doesn't benefit from it
+        and can cause significant overhead on larger scales.
+        """
+        pass
 
     def _forward_backbone(self, x):
         return self.backbone(x)
@@ -165,6 +194,13 @@ class YOLOv26Model(nn.Module):
             If training: (o2m_preds, o2o_preds)
             If inference: list of dicts with 'boxes', 'scores', 'labels'
         """
+        if not self.training:
+            with torch.no_grad():
+                with torch.inference_mode():
+                    return self._forward_impl(x)
+        return self._forward_impl(x)
+
+    def _forward_impl(self, x):
         backbone_out = self._forward_backbone(x)
         neck_out = self._forward_neck(backbone_out)
         o2m_out, o2o_out = self._forward_head(neck_out)

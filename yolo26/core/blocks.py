@@ -74,15 +74,14 @@ class C3k2(nn.Module):
 
     def forward(self, x):
         # cv1: in_ch -> (n+1)*c
-        y = self.cv1(x)          # (B, (n+1)*c, H, W)
-        # Split y into n chunks of c channels each: [chunk_0, ..., chunk_{n-1}]
-        chunks = list(y.split(self.c, dim=1))  # list of n tensors, each (B, c, H, W)
-        # Passthrough copy of input for the "b" branch
-        outs = [chunks[0].clone()]  # b = passthrough of first chunk
-        # Feed each subsequent chunk through its bottleneck
+        y = self.cv1(x)
+        # Split: [y1(bypass), rest(chunks_0..n-1)]
+        y1, y_rest = y.split([self.c, self.c * self.n], dim=1)
+        # Concatenate: [bypass, m0(chunk_0), m1(chunk_1), ...]
+        outs = [y1]
         for i in range(self.n):
-            outs.append(self.m[i](chunks[i]))
-        # Concatenate: [b, m0(chunk_0), m1(chunk_1), ...] -> (n+1)*c
+            chunk_i = y_rest[:, i * self.c:(i + 1) * self.c]
+            outs.append(self.m[i](chunk_i))
         return self.cv2(torch.cat(outs, dim=1))
 
 

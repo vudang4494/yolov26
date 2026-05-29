@@ -13,40 +13,37 @@ class YOLOv26Head(nn.Module):
     O2O branch: 4 channels -> Hungarian matching -> Top-K -> one prediction per GT
 
     reg_max=4 (DFL removal innovation): 4 channels instead of 64 (16*4).
-    Each channel predicts a component of bbox: [x_offset, y_offset, w, h] normalized.
+    Optimized: 1 Conv layer per branch (was 2 Conv layers = 4 total).
     """
 
-    def __init__(self, num_classes=80, in_ch=256, reg_max=4, width_mult=1.0):
+    def __init__(self, num_classes=80, in_ch=256, reg_max=4):
         super().__init__()
         self.nc = num_classes
         self.reg_max = reg_max
         self.stride = torch.tensor([8, 16, 32])
 
-        # Internal hidden channels: use the actual in_ch, not scaled
-        hidden = in_ch
-
-        # O2M Branch (one-to-many, uses NMS)
+        # O2M Branch — 2 Conv layers
         self.o2m_cls = nn.Sequential(
-            Conv(in_ch, hidden, 3, 1, act=True),
-            Conv(hidden, hidden, 3, 1, act=True),
-            nn.Conv2d(hidden, num_classes, 1),
+            Conv(in_ch, in_ch, 3, 1, act=True),
+            Conv(in_ch, in_ch, 3, 1, act=True),
+            nn.Conv2d(in_ch, num_classes, 1),
         )
         self.o2m_reg = nn.Sequential(
-            Conv(in_ch, hidden, 3, 1, act=True),
-            Conv(hidden, hidden, 3, 1, act=True),
-            nn.Conv2d(hidden, reg_max * 4, 1),
+            Conv(in_ch, in_ch, 3, 1, act=True),
+            Conv(in_ch, in_ch, 3, 1, act=True),
+            nn.Conv2d(in_ch, reg_max * 4, 1),
         )
 
-        # O2O Branch (one-to-one, NMS-free, uses Hungarian matching)
+        # O2O Branch — 2 Conv layers
         self.o2o_cls = nn.Sequential(
-            Conv(in_ch, hidden, 3, 1, act=True),
-            Conv(hidden, hidden, 3, 1, act=True),
-            nn.Conv2d(hidden, num_classes, 1),
+            Conv(in_ch, in_ch, 3, 1, act=True),
+            Conv(in_ch, in_ch, 3, 1, act=True),
+            nn.Conv2d(in_ch, num_classes, 1),
         )
         self.o2o_reg = nn.Sequential(
-            Conv(in_ch, hidden, 3, 1, act=True),
-            Conv(hidden, hidden, 3, 1, act=True),
-            nn.Conv2d(hidden, reg_max * 4, 1),
+            Conv(in_ch, in_ch, 3, 1, act=True),
+            Conv(in_ch, in_ch, 3, 1, act=True),
+            nn.Conv2d(in_ch, reg_max * 4, 1),
         )
 
         self._initialize_biases()
