@@ -224,14 +224,15 @@ class YOLOv26Model(nn.Module):
         return total
 
     def count_flops(self, input_size=640):
-        """Estimate FLOPs for a forward pass."""
-        h = w = input_size
+        """Estimate FLOPs: sum Conv FLOPs = H*W*K*K*Cin*Cout*out_channels * n_params."""
         flops = 0
-        for p in self.parameters():
-            if p.grad is not None:
-                continue
-            flops += p.numel()
-        return flops * h * w // (p.numel() if p.numel() > 0 else 1)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                h_out = input_size // (m.stride[0] * 8)  # approximate after backbone
+                w_out = input_size // (m.stride[1] * 8)
+                flops += h_out * w_out * m.in_channels * m.out_channels * \
+                         m.kernel_size[0] * m.kernel_size[1] * m.groups
+        return int(flops)
 
 
 def build_yolo26(scale="n", num_classes=80, image_size=640, **kwargs):

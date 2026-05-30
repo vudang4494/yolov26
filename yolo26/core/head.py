@@ -52,7 +52,6 @@ class YOLOv26Head(nn.Module):
         """Initialize classification bias for foreground class imbalance."""
         for conv in [self.o2m_cls, self.o2o_cls]:
             b = conv[-1].bias
-            num_classes = self.nc
             nn.init.constant_(b, -math.log((1 - 0.01) / 0.01))
 
     def forward(self, features):

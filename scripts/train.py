@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-YOLOv26 Training Script with real dataset support.
+YOLOv26 Training Script - Full pipeline with augmentation, EMA, warmup, validation.
 """
 import argparse
+import json
+import math
 import os
 import sys
 import time
-import yaml
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-from pathlib import Path
+import torch.nn.functional as F
+import yaml
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from yolo26.core.model import YOLOv26Model
@@ -17,23 +22,54 @@ from yolo26.core.loss import YOLOv26Loss
 from yolo26.optimizers.musgd import MuSGD
 
 
-def build_dataloader(data_yaml=None, batch_size=8, img_size=640, num_classes=80, shuffle=True, workers=4):
+# ─── EMA ────────────────────────────────────────────────────────────────────────
+
+class ModelEMA:
     """
-    Build dataloader. If data_yaml is provided, loads real images from COCO-style YAML.
-    Falls back to synthetic data if no YAML or images unavailable.
+    Exponential Moving Average of model weights.
+    Stabilizes training and typically improves final accuracy by 0.5-1% mAP.
     """
+
+    def __init__(self, model, decay=0.9999, device="cpu"):
+        import copy
+        self.ema = copy.deepcopy(model).eval()
+        self.ema.to(device)
+        self.decay = decay
+        self.device = device
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    def update(self, model):
+        with torch.no_grad():
+            for ema_p, p in zip(self.ema.parameters(), model.parameters()):
+                ema_p.data.mul_(self.decay).add_(p.data, alpha=1 - self.decay)
+
+
+# ─── Data augmentation ────────────────────────────────────────────────────────
+
+from yolo26.augmentation import (
+    MosaicAugmentation, MixUpAugmentation, RandomFlip,
+    ColorJitter, RandomCrop, AugmentationPipeline,
+)
+
+
+# ─── Data loading ─────────────────────────────────────────────────────────────
+
+def build_dataloader(data_yaml=None, batch_size=8, img_size=640, num_classes=80,
+                     shuffle=True, workers=4, augment=False):
     if data_yaml and os.path.exists(data_yaml):
         try:
-            return _build_coco_dataloader(data_yaml, batch_size, img_size, num_classes, shuffle, workers)
+            return _build_coco_dataloader(data_yaml, batch_size, img_size,
+                                          num_classes, shuffle, workers, augment)
         except Exception as e:
             print(f"[WARN] Failed to load {data_yaml}: {e}, using synthetic data")
 
-    print("[INFO] Using synthetic dataset (no valid data.yaml)")
-    return _build_synthetic_loader(batch_size, img_size, num_classes, shuffle)
+    print("[INFO] Using synthetic dataset")
+    return _build_synthetic_loader(batch_size, img_size, num_classes, shuffle, augment)
 
 
-def _build_coco_dataloader(data_yaml, batch_size, img_size, num_classes, shuffle, workers):
-    """Load COCO-style dataset from YAML."""
+def _build_coco_dataloader(data_yaml, batch_size, img_size, num_classes,
+                           shuffle, workers, augment):
     import cv2
     from torch.utils.data import Dataset, DataLoader
 
@@ -41,15 +77,18 @@ def _build_coco_dataloader(data_yaml, batch_size, img_size, num_classes, shuffle
         data = yaml.safe_load(f)
 
     root = Path(data_yaml).parent / data.get("path", "")
-    img_dir = root / data["train"] if "train" in data else root
+    img_dir = root / (data["train"] if "train" in data else "images/train")
     label_dir = root / (str(data["train"]).replace("images", "labels"))
 
     class COCODataset(Dataset):
-        def __init__(self, img_dir, label_dir, img_size, num_classes):
+        def __init__(self, img_dir, label_dir, img_size, num_classes, augment=False):
             self.img_dir = Path(img_dir)
             self.label_dir = Path(label_dir)
             self.img_size = img_size
             self.nc = num_classes
+            self.augment = augment
+            self.flip = RandomFlip(prob=0.5)
+            self.color = ColorJitter(prob=0.5)
             self.img_files = sorted([
                 f for f in self.img_dir.iterdir()
                 if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp")
@@ -87,51 +126,53 @@ def _build_coco_dataloader(data_yaml, batch_size, img_size, num_classes, shuffle
 
             if targets:
                 targets = torch.tensor(targets)
-                targets[:, 1] *= self.img_size / orig_w
-                targets[:, 2] *= self.img_size / orig_h
-                targets[:, 3] *= self.img_size / orig_w
-                targets[:, 4] *= self.img_size / orig_h
-                targets[:, 1:5] /= self.img_size
-                targets[:, 1:5] = targets[:, 1:5].clamp(0, 1)
             else:
                 targets = torch.zeros(0, 5)
 
+            # Apply augmentation
+            if self.augment and targets.shape[0] > 0:
+                targets_full = torch.cat([
+                    torch.zeros(targets.shape[0], 1), targets
+                ], dim=1)
+                img, targets_full = self.flip(img, targets_full)
+                img = self.color(img)
+                targets = targets_full[:, 1:]
+
             return img, targets
 
-    dataset = COCODataset(img_dir, label_dir, img_size, num_classes)
+    dataset = COCODataset(img_dir, label_dir, img_size, num_classes, augment)
     loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=workers,
-        collate_fn=_collate_fn,
+        dataset, batch_size=batch_size, shuffle=shuffle,
+        num_workers=workers, collate_fn=_collate_fn,
         pin_memory=torch.cuda.is_available(),
     )
-    print(f"[INFO] Loaded {len(dataset)} images from {img_dir}")
+    print(f"[INFO] Loaded {len(dataset)} images from {img_dir} (augment={augment})")
     return loader
 
 
 def _collate_fn(batch):
-    """Collate batch: images + variable-length targets."""
-    imgs = torch.stack([b[0] if isinstance(b[0], torch.Tensor) else torch.from_numpy(b[0]).permute(2, 0, 1).float() / 255.0
+    imgs = torch.stack([b[0] if isinstance(b[0], torch.Tensor) else
+                        torch.from_numpy(b[0]).permute(2, 0, 1).float() / 255.0
                         for b in batch])
     targets_list = []
     batch_idx = 0
     for img, targets in batch:
         if isinstance(targets, torch.Tensor) and targets.shape[0] > 0:
             t = targets.clone()
-            t = torch.cat([torch.full((t.shape[0], 1), batch_idx, dtype=t.dtype, device=t.device), t], dim=1)
+            t = torch.cat([torch.full((t.shape[0], 1), batch_idx,
+                       dtype=t.dtype, device=t.device), t], dim=1)
             targets_list.append(t)
         batch_idx += 1
     targets = torch.cat(targets_list, dim=0) if targets_list else torch.zeros(0, 6)
     return imgs, targets
 
 
-def _build_synthetic_loader(batch_size, img_size, num_classes, shuffle):
-    """Synthetic dataset for quick testing."""
+def _build_synthetic_loader(batch_size, img_size, num_classes, shuffle, augment):
     class DummyDataset:
         def __init__(self, size=1000):
             self.size = size
+            self.flip = RandomFlip(prob=0.5)
+            self.color = ColorJitter(prob=0.5)
 
         def __len__(self):
             return self.size
@@ -145,6 +186,13 @@ def _build_synthetic_loader(batch_size, img_size, num_classes, shuffle):
             boxes[:, 1] = boxes[:, 1].clamp(boxes[:, 3] / 2, 1 - boxes[:, 3] / 2)
             cls = torch.randint(0, num_classes, (num_gt,))
             targets = torch.cat([cls.float().unsqueeze(1), boxes], dim=1)
+
+            if augment:
+                img = self.color(img)
+                targets_full = torch.cat([torch.zeros(num_gt, 1), targets], dim=1)
+                img, targets_full = self.flip(img, targets_full)
+                targets = targets_full[:, 1:]
+
             return img, targets
 
     class DummyLoader:
@@ -172,60 +220,190 @@ def _build_synthetic_loader(batch_size, img_size, num_classes, shuffle):
     return DummyLoader(DummyDataset(), batch_size, shuffle)
 
 
+# ─── Validation / mAP ──────────────────────────────────────────────────────────
+
+def box_iou(boxes1, boxes2, eps=1e-7):
+    """Compute IoU between two sets of boxes in cxcywh format."""
+    if boxes1.shape[0] == 0 or boxes2.shape[0] == 0:
+        return torch.zeros(boxes1.shape[0], boxes2.shape[0])
+    b1 = boxes1.unsqueeze(1)
+    b2 = boxes2.unsqueeze(0)
+    inter = torch.min(b1[..., 2:], b2[..., 2:]).clamp(min=0).prod(dim=-1)
+    area1 = (boxes1[..., 2] * boxes1[..., 3]).unsqueeze(1)
+    area2 = (boxes2[..., 2] * boxes2[..., 3]).unsqueeze(0)
+    return inter / (area1 + area2 - inter + eps)
+
+
+def compute_ap(precisions, recalls):
+    """11-point interpolation AP."""
+    if len(recalls) == 0:
+        return 0.0
+    recalls = sorted(set(recalls + [0.0, 1.0]))
+    precisions = sorted(set(precisions + [0.0]))
+    for i in range(len(precisions) - 1, 0, -1):
+        precisions[i - 1] = max(precisions[i - 1], precisions[i])
+    ap = sum((recalls[i + 1] - recalls[i]) * precisions[i + 1]
+             for i in range(len(recalls) - 1))
+    return ap
+
+
+def validate(model, val_loader, device, num_classes=80, image_size=640, max_batches=100):
+    """Run validation: compute mAP@0.5."""
+    model.eval()
+    all_preds = []
+    all_gts = []
+    batch_count = 0
+
+    with torch.no_grad():
+        for images, targets in val_loader:
+            if batch_count >= max_batches:
+                break
+            images = images.to(device)
+            results = model.predict(images)
+            for b, det in enumerate(results):
+                gt_b = targets[targets[:, 0] == b]
+                all_gts.append(gt_b)
+                all_preds.append(det)
+            batch_count += 1
+
+    # Compute AP per class
+    aps = []
+    for cls in range(num_classes):
+        cls_dets = [(i, p) for i, p in enumerate(all_preds)
+                    for j in range(len(p["labels"]))
+                    if p["labels"][j] == cls]
+        cls_gts = [(i, g) for i, g in enumerate(all_gts)
+                   for j in range(len(g))
+                   if int(g[j, 1]) == cls]
+
+        if not cls_gts:
+            continue
+
+        cls_dets.sort(key=lambda x: x[1]["scores"].cpu(), reverse=True)
+        tp = torch.zeros(len(cls_dets))
+        fp = torch.zeros(len(cls_dets))
+        gt_matched = [False] * len(cls_gts)
+
+        for k, (img_idx, det) in enumerate(cls_dets):
+            best_iou = 0
+            best_gt = -1
+            for gt_idx, (gt_img_idx, gt) in enumerate(cls_gts):
+                if gt_matched[gt_idx] or gt_img_idx != img_idx:
+                    continue
+                iou = box_iou(det["boxes"].cpu(), gt[:, 2:6])[0, 0].item()
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt = gt_idx
+            if best_iou >= 0.5:
+                tp[k] = 1
+                gt_matched[best_gt] = True
+            else:
+                fp[k] = 1
+
+        tp_cum = tp.cumsum(dim=0)
+        fp_cum = fp.cumsum(dim=0)
+        recalls = tp_cum / len(cls_gts)
+        precisions = tp_cum / (tp_cum + fp_cum + 1e-9)
+        ap = compute_ap(precisions.tolist(), recalls.tolist())
+        aps.append(ap)
+
+    mAP = (sum(aps) / len(aps) * 100) if aps else 0.0
+    model.train()
+    return {"mAP@0.5": round(mAP, 2), "n_classes": len(aps)}
+
+
+# ─── Training ──────────────────────────────────────────────────────────────────
+
 def train(args):
     device = args.device
     if device == "mps" and not torch.backends.mps.is_available():
-        print("MPS not available, using CPU")
         device = "cpu"
 
-    print(f"Training YOLOv26-{args.scale.upper()} on {device}")
+    print(f"\n{'='*60}")
+    print(f"  YOLOv26-{args.scale.upper()} Training on {device}")
     print(f"  Epochs: {args.epochs} | Batch: {args.batch} | LR: {args.lr}")
+    print(f"  Warmup: {args.warmup_epochs} | EMA decay: {args.ema_decay}")
+    print(f"  Data: {args.data or 'synthetic'}")
+    print(f"{'='*60}\n")
 
+    # Build model
     model = YOLOv26Model(
         num_classes=args.num_classes,
         scale=args.scale,
         image_size=args.img_size,
     ).to(device)
-
     model.info()
-    criterion = YOLOv26Loss(num_classes=args.num_classes)
 
+    # EMA
+    ema = ModelEMA(model, decay=args.ema_decay, device=device)
+
+    # Loss
+    criterion = YOLOv26Loss(
+        num_classes=args.num_classes,
+        alpha_prog=args.alpha_prog,
+        beta_stal=args.beta_stal,
+        o2o_weight=args.o2o_weight,
+        box_weight=args.box_weight,
+    )
+
+    # Optimizer
     optimizer = MuSGD(
-        model.parameters(),
-        lr=args.lr,
-        momentum=0.9,
-        weight_decay=5e-4,
-        nesterov=True,
+        model.parameters(), lr=args.lr,
+        momentum=args.momentum, weight_decay=args.weight_decay,
+        nesterov=True, ns_warmup=args.warmup_epochs * 100,
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
-    )
+    # Warmup + CosineAnnealing
+    total_steps = args.epochs
+    warmup_steps = args.warmup_epochs
 
-    dataloader = build_dataloader(
-        args.data or None,
-        args.batch,
-        args.img_size,
-        args.num_classes,
-        shuffle=True,
-    )
+    def lr_fn(step):
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return 0.5 * (1 + math.cos(math.pi * progress))
 
-    # AMP: use bfloat16 on MPS/CPU, float16 on CUDA
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_fn)
+
+    # Dataloaders
+    train_loader = build_dataloader(
+        args.data, args.batch, args.img_size, args.num_classes,
+        shuffle=True, workers=args.workers, augment=True,
+    )
+    val_loader = build_dataloader(
+        args.data, args.batch, args.img_size, args.num_classes,
+        shuffle=False, workers=args.workers, augment=False,
+    ) if args.data else None
+
+    # AMP
     use_amp = device in ("mps", "cuda")
     scaler = torch.amp.GradScaler(device, enabled=use_amp) if use_amp else None
+
+    # Logging
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    global_step = 0
+    best_map = 0.0
 
     for epoch in range(args.epochs):
         model.train()
         epoch_loss = 0
         epoch_start = time.time()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
 
-        for batch_idx, (images, targets) in enumerate(dataloader):
+        for batch_idx, (images, targets) in enumerate(pbar):
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
 
+            # Skip empty batches
+            if targets.shape[0] == 0:
+                continue
+
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast(device_type=device, dtype=torch.bfloat16 if device == "mps" else torch.float16):
+            with torch.amp.autocast(device_type=device,
+                                    dtype=torch.bfloat16 if device == "mps" else torch.float16,
+                                    enabled=use_amp):
                 o2m, o2o = model(images)
                 loss, losses = criterion(o2m, o2o, targets,
                                         model.anchor_list, args.img_size)
@@ -233,81 +411,120 @@ def train(args):
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
                 optimizer.step()
 
+            scheduler.step()
+            ema.update(model)
+
+            global_step += 1
             epoch_loss += loss.item()
 
-            if batch_idx % 10 == 0:
-                print(f"  Epoch {epoch+1}/{args.epochs} | "
-                      f"Batch {batch_idx}/{len(dataloader)} | "
-                      f"Loss: {loss.item():.4f} | "
-                      f"Cls: {losses['cls']:.4f} | "
-                      f"Box: {losses['box']:.4f}")
+            lr_now = scheduler.get_last_lr()[0]
+            pbar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "cls": f"{losses['cls'].item():.4f}",
+                "box": f"{losses['box'].item():.4f}",
+                "lr": f"{lr_now:.6f}",
+            })
 
-        scheduler.step()
-        avg_loss = epoch_loss / len(dataloader)
+        avg_loss = epoch_loss / max(len(train_loader), 1)
         elapsed = time.time() - epoch_start
+        current_lr = scheduler.get_last_lr()[0]
 
-        print(f"\nEpoch {epoch+1}/{args.epochs} | "
-              f"Avg Loss: {avg_loss:.4f} | "
-              f"Time: {elapsed:.1f}s | "
-              f"LR: {scheduler.get_last_lr()[0]:.6f}\n")
+        # Validation
+        val_map = 0.0
+        if val_loader is not None and (epoch + 1) % args.val_every == 0:
+            val_results = validate(model, val_loader, device,
+                                  args.num_classes, args.img_size, max_batches=100)
+            val_map = val_results["mAP@0.5"]
+            print(f"\n  Epoch {epoch+1} | "
+                  f"Loss: {avg_loss:.4f} | "
+                  f"Val mAP@0.5: {val_map:.2f}% | "
+                  f"Time: {elapsed:.1f}s | "
+                  f"LR: {current_lr:.6f}")
+            if val_map > best_map:
+                best_map = val_map
+                torch.save(
+                    ema.ema.state_dict(),
+                    os.path.join(args.save_dir, f"yolo26_{args.scale}_best.pt")
+                )
+                print(f"  New best mAP: {best_map:.2f}%")
+        else:
+            print(f"\n  Epoch {epoch+1} | "
+                  f"Loss: {avg_loss:.4f} | "
+                  f"Time: {elapsed:.1f}s | "
+                  f"LR: {current_lr:.6f}")
 
+        # Save checkpoint
         if (epoch + 1) % args.save_every == 0:
             ckpt = {
                 "epoch": epoch + 1,
                 "model": model.state_dict(),
+                "ema": ema.ema.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "loss": avg_loss,
+                "val_map": val_map,
+                "best_map": best_map,
                 "scale": args.scale,
                 "num_classes": args.num_classes,
             }
-            ckpt_path = f"runs/yolo26_{args.scale}_e{epoch+1}.pt"
-            os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
+            ckpt_path = os.path.join(args.save_dir,
+                                     f"yolo26_{args.scale}_e{epoch+1}.pt")
             torch.save(ckpt, ckpt_path)
-            print(f"Saved checkpoint: {ckpt_path}")
+            print(f"  Saved: {ckpt_path}")
 
-    final_ckpt = {
+    # Final save
+    final_path = os.path.join(args.save_dir, f"yolo26_{args.scale}_final.pt")
+    torch.save({
         "epoch": args.epochs,
         "model": model.state_dict(),
+        "ema": ema.ema.state_dict(),
         "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
         "scale": args.scale,
         "num_classes": args.num_classes,
-    }
-    final_path = f"runs/yolo26_{args.scale}_final.pt"
-    os.makedirs(os.path.dirname(final_path) or ".", exist_ok=True)
-    torch.save(final_ckpt, final_path)
-    print(f"\nTraining complete. Model saved to {final_path}")
+        "best_map": best_map,
+    }, final_path)
+    print(f"\nTraining complete. Best mAP@0.5: {best_map:.2f}%")
+    print(f"Model saved to {final_path}")
 
+
+# ─── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="YOLOv26 Training")
     parser.add_argument("--scale", type=str, default="n",
                        help="Model scale: n, s, m, l")
-    parser.add_argument("--epochs", type=int, default=10,
-                       help="Number of training epochs")
-    parser.add_argument("--batch", type=int, default=8,
-                       help="Batch size per device")
-    parser.add_argument("--lr", type=float, default=0.01,
-                       help="Learning rate")
-    parser.add_argument("--device", type=str, default="mps",
-                       help="Device: mps, cpu, cuda")
-    parser.add_argument("--img-size", type=int, default=640,
-                       help="Input image size")
-    parser.add_argument("--num-classes", type=int, default=80,
-                       help="Number of classes")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument("--momentum", type=float, default=0.9)
+    parser.add_argument("--weight-decay", type=float, default=5e-4)
+    parser.add_argument("--device", type=str, default="mps")
+    parser.add_argument("--img-size", type=int, default=640)
+    parser.add_argument("--num-classes", type=int, default=80)
     parser.add_argument("--data", type=str, default="",
                        help="Path to COCO-style data YAML")
-    parser.add_argument("--save-every", type=int, default=10,
-                       help="Save checkpoint every N epochs")
+    parser.add_argument("--save-dir", type=str, default="runs")
+    parser.add_argument("--save-every", type=int, default=10)
+    parser.add_argument("--val-every", type=int, default=5)
+    parser.add_argument("--warmup-epochs", type=int, default=3)
+    parser.add_argument("--ema-decay", type=float, default=0.9999)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--alpha-prog", type=float, default=0.3,
+                       help="ProgLoss class re-weighting strength")
+    parser.add_argument("--beta-stal", type=float, default=0.3,
+                       help="STAL small-target weight boost")
+    parser.add_argument("--o2o-weight", type=float, default=1.0,
+                       help="O2O branch loss weight")
+    parser.add_argument("--box-weight", type=float, default=7.5,
+                       help="Box regression loss weight")
     args = parser.parse_args()
     train(args)
 

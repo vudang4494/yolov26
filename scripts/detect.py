@@ -139,7 +139,12 @@ def main():
 
     if args.weights:
         print(f"Loading weights from {args.weights}")
-        state = torch.load(args.weights, map_location=device)
+        state = torch.load(args.weights, map_location=device, weights_only=False)
+        if isinstance(state, dict):
+            if "model" in state and isinstance(state["model"], dict):
+                state = state["model"]
+            elif "state_dict" in state:
+                state = state["state_dict"]
         model.load_state_dict(state, strict=False)
 
     model.info()

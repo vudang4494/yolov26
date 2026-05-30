@@ -4,5 +4,7 @@ opencv-python>=4.8.0
 pillow>=10.0.0
 numpy>=1.24.0
 tqdm>=4.65.0
+pyyaml>=6.0.0
+scipy>=1.10.0
 onnx>=1.16.0
 onnxruntime>=1.18.0
