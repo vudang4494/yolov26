@@ -13,14 +13,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from yolo26.core.model import YOLOv26Model
-from yolo26.core.postprocess import PostProcess
 
 
-def draw_boxes(image, results, class_names=None, conf_thresh=0.25):
-    """Draw detection boxes on image."""
+def draw_boxes(image, results, class_names=None):
+    """Draw detection boxes on image. Boxes expected in image-pixel space."""
     if class_names is None:
         class_names = [f"class_{i}" for i in range(80)]
 
+    H, W = image.shape[:2]
     for det in results:
         boxes = det["boxes"]
         scores = det["scores"]
@@ -29,65 +29,86 @@ def draw_boxes(image, results, class_names=None, conf_thresh=0.25):
         if boxes.numel() == 0:
             continue
 
+        # boxes are in image-pixel space: [x1, y1, x2, y2]
         boxes_np = boxes.cpu().numpy()
-        scores_np = scores.cpu().numpy() if scores.is_cuda else scores.numpy()
-        labels_np = labels.cpu().numpy() if labels.is_cuda else labels.numpy()
-
-        H, W = image.shape[:2]
-        boxes_np[:, [0, 2]] *= W
-        boxes_np[:, [1, 3]] *= H
+        scores_np = scores.cpu().numpy()
+        labels_np = labels.cpu().numpy()
 
         for box, score, label in zip(boxes_np, scores_np, labels_np):
             x1, y1, x2, y2 = box.astype(int)
+            # Clamp to image bounds
+            x1, x2 = max(0, min(W - 1, x1)), max(0, min(W - 1, x2))
+            y1, y2 = max(0, min(H - 1, y1)), max(0, min(H - 1, y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
             cls_id = int(label)
             color = (0, 255, 0)
 
             cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
             label_text = f"{class_names[cls_id]}: {score:.2f}"
-            cv2.putText(image, label_text, (x1, y1 - 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.putText(image, label_text, (x1, max(y1 - 5, 10)),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     return image
 
 
 def load_image(path, size=640):
-    """Load and resize image to model input size."""
+    """Load image, apply letterbox padding, return canvas + scale info."""
     img = cv2.imread(path)
     if img is None:
         raise ValueError(f"Cannot load image: {path}")
     orig_h, orig_w = img.shape[:2]
 
+    # Letterbox resize
     scale = min(size / orig_w, size / orig_h)
     new_w = int(orig_w * scale)
     new_h = int(orig_h * scale)
+
     resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
+    # Canvas with letterbox padding
     canvas = np.full((size, size, 3), 114, dtype=np.uint8)
-    canvas[:new_h, :new_w] = resized
+    pad_top = (size - new_h) // 2
+    pad_left = (size - new_w) // 2
+    canvas[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized
 
-    canvas = canvas[:, :, ::-1].transpose(2, 0, 1) / 255.0
-    canvas = np.ascontiguousarray(canvas, dtype=np.float32)
-    return torch.from_numpy(canvas).unsqueeze(0), img, (new_w, new_h), (orig_w, orig_h), scale
+    # HWC -> CHW -> [0, 1]
+    canvas_t = torch.from_numpy(canvas[:, :, ::-1]).permute(2, 0, 1).float() / 255.0
+
+    return canvas_t, img, new_w, new_h, orig_w, orig_h, scale, pad_top, pad_left
 
 
-def detect_image(model, image_path, device="mps", conf_thresh=0.25, iou_thresh=0.45):
+def detect_image(model, image_path, device="mps", conf_thresh=0.25, iou_thresh=0.45, img_size=640):
     """Run detection on a single image."""
     model.eval()
-    x, orig_img, (new_w, new_h), (orig_w, orig_h), scale = load_image(image_path)
-    x = x.to(device)
+
+    canvas_t, orig_img, new_w, new_h, orig_w, orig_h, scale, pad_top, pad_left = load_image(image_path, img_size)
+    canvas_t = canvas_t.unsqueeze(0).to(device)
 
     with torch.no_grad():
         start = time.time()
-        results = model(x)
+        results = model.predict(canvas_t)
         latency = (time.time() - start) * 1000
 
-    H, W = orig_img.shape[:2]
+    # PostProcess returns boxes in normalized canvas-space [0, 1].
+    # Convert to canvas-pixel space, then clip padding, then scale to original image.
     for det in results:
-        det["boxes"][:, [0, 2]] /= scale
-        det["boxes"][:, [1, 3]] /= scale
-        det["boxes"][:, 0].clamp_(0, W)
-        det["boxes"][:, 1].clamp_(0, H)
-        det["boxes"][:, 2].clamp_(0, W)
-        det["boxes"][:, 3].clamp_(0, H)
+        boxes = det["boxes"]  # (N, 4) normalized [0, 1]
+        boxes[:, [0, 2]] *= img_size  # canvas pixel coords
+        boxes[:, [1, 3]] *= img_size
+
+        # Remove letterbox padding
+        boxes[:, [0, 2]] -= pad_left
+        boxes[:, [1, 3]] -= pad_top
+
+        # Scale to original image
+        boxes[:, [0, 2]] /= scale
+        boxes[:, [1, 3]] /= scale
+
+        # Clamp to original image dimensions
+        boxes[:, 0].clamp_(0, orig_w)
+        boxes[:, 2].clamp_(0, orig_w)
+        boxes[:, 1].clamp_(0, orig_h)
+        boxes[:, 3].clamp_(0, orig_h)
 
     result_img = draw_boxes(orig_img.copy(), results)
 
@@ -107,7 +128,7 @@ def main():
     parser.add_argument("--model", type=str, default="n",
                        help="Model scale: n, s, m, l, x")
     parser.add_argument("--weights", type=str, default="",
-                       help="Path to pretrained weights (optional)")
+                       help="Path to pretrained weights")
     parser.add_argument("--device", type=str, default="mps",
                        help="Device: mps, cpu, cuda")
     parser.add_argument("--conf", type=float, default=0.25,
@@ -137,7 +158,9 @@ def main():
         print(f"Loading weights from {args.weights}")
         state = torch.load(args.weights, map_location=device, weights_only=False)
         if isinstance(state, dict):
-            if "model" in state and isinstance(state["model"], dict):
+            if "ema" in state and isinstance(state["ema"], dict):
+                state = state["ema"]
+            elif "model" in state and isinstance(state["model"], dict):
                 state = state["model"]
             elif "state_dict" in state:
                 state = state["state_dict"]
@@ -146,7 +169,7 @@ def main():
     model.info()
 
     class_names = None
-    if args.class_names:
+    if args.class_names and os.path.exists(args.class_names):
         with open(args.class_names) as f:
             class_names = [l.strip() for l in f]
 
@@ -154,23 +177,23 @@ def main():
     if save_dir:
         save_dir.mkdir(parents=True, exist_ok=True)
 
+    # Quick model test
     if args.source == "" or args.source == "0":
-        print("No source provided. Running quick model test instead...")
+        print("Running quick model test...")
         x = torch.randn(1, 3, args.img_size, args.img_size).to(device)
         model.eval()
         with torch.no_grad():
             t0 = time.time()
-            results = model(x)
+            results = model.predict(x)
             t1 = time.time()
-        print(f"Forward pass: {(t1-t0)*1000:.1f}ms")
-        print(f"Output type: {type(results)}")
-        if isinstance(results, list):
-            print(f"Detections: {len(results[0])} items")
+        print(f"Forward + postprocess: {(t1-t0)*1000:.1f}ms")
+        print(f"Output: {len(results[0])} detections")
         return
 
+    # Image or directory
     if os.path.isdir(args.source):
         image_paths = []
-        for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp"]:
+        for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp", "*.JPG", "*.JPEG", "*.PNG"]:
             image_paths.extend(Path(args.source).glob(ext))
         print(f"Found {len(image_paths)} images")
     else:
@@ -180,7 +203,7 @@ def main():
     for img_path in image_paths:
         try:
             result_img, _, latency = detect_image(
-                model, str(img_path), device, args.conf, args.iou
+                model, str(img_path), device, args.conf, args.iou, args.img_size
             )
             total_time += latency
 

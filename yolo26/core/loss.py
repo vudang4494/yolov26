@@ -40,12 +40,6 @@ class YOLOv26Loss(nn.Module):
         total = freq.sum() + 1e-7
         freq = freq / total
         return 1.0 + self.alpha_prog * (1.0 - freq)
-        freq = torch.zeros(num_classes, device=device)
-        for cls in targets[:, 1].unique():
-            freq[int(cls)] = (targets[:, 1] == cls).sum().float()
-        total = freq.sum() + 1e-7
-        freq = freq / total
-        return 1.0 + self.alpha_prog * (1.0 - freq)
 
     def _stal_weight(self, gt_w, gt_h, image_size, stride):
         """

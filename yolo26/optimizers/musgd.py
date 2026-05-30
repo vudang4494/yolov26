@@ -51,13 +51,18 @@ class MuSGD(torch.optim.SGD):
         mat = out_ch * in_ch * kH * kW
         return mat >= 512 and out_ch >= 16
 
-    def _apply_ns_correction(self, W, lr=0.1, iterations=3):
+    def _apply_ns_correction(self, W, lr=0.1):
         """
         Newton-Schulz gradient correction for (out_ch, in_ch * kH * kW) matrices.
-        Adds gradient penalty: penalizes ||W.T @ W - I|| and ||W @ W.T - I||.
+        Adds gradient penalty for orthogonality to reduce filter co-adaptation.
+
+        Correct analytical gradients (from ||W.T @ W - I||^2):
+            d/dW ||W.T @ W - I||^2 = 4 * W @ (W.T @ W - I)  [shape: m x n]
+            d/dW ||W @ W.T - I||^2 = 4 * (W @ W.T - I) @ W  [shape: m x n]
+        Combined: grad = 4 * (W @ (W.T @ W - I) + (W @ W.T - I) @ W)
 
         This modifies p.grad in-place before super().step() applies the update.
-        Compatible with AMP GradScaler since it happens before the scaler step.
+        Compatible with AMP GradScaler since it runs before the scaler step.
         """
         if W.grad is None:
             return
@@ -68,16 +73,14 @@ class MuSGD(torch.optim.SGD):
 
         W_mat = W.reshape(out_ch, -1)
 
-        # Gradient penalty: d/dW ||W.T @ W - I||² = 4 * W @ (W.T @ W - I)
-        #                d/dW ||W @ W.T - I||² = 4 * (W @ W.T - I) @ W
-        # Both give shape (m, n) — same as W
         WTW = W_mat.T @ W_mat
         I_n = torch.eye(n, device=W.device, dtype=W_mat.dtype)
         WWT = W_mat @ W_mat.T
         I_m = torch.eye(m, device=W.device, dtype=W_mat.dtype)
 
-        grad_orth = 2.0 * (W_mat @ (WTW - I_n) + (WWT - I_m) @ W_mat)
+        # Correct analytical gradient with factor 4
+        grad_orth = 4.0 * (W_mat @ (WTW - I_n) + (WWT - I_m) @ W_mat)
 
-        # Apply correction: small scale to avoid destabilizing training
+        # Apply correction: very small scale to avoid destabilizing training
         alpha = self.ns_lr * 0.01
         W.grad.add_(grad_orth.reshape(shape), alpha=alpha)

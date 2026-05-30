@@ -222,15 +222,28 @@ def _build_synthetic_loader(batch_size, img_size, num_classes, shuffle, augment)
 # ─── Validation / mAP ──────────────────────────────────────────────────────────
 
 def box_iou(boxes1, boxes2, eps=1e-7):
-    """Compute IoU between two sets of boxes in cxcywh format."""
+    """IoU between two sets of boxes in cxcywh format."""
     if boxes1.shape[0] == 0 or boxes2.shape[0] == 0:
         return torch.zeros(boxes1.shape[0], boxes2.shape[0])
-    b1 = boxes1.unsqueeze(1)
-    b2 = boxes2.unsqueeze(0)
-    inter = torch.min(b1[..., 2:], b2[..., 2:]).clamp(min=0).prod(dim=-1)
-    area1 = (boxes1[..., 2] * boxes1[..., 3]).unsqueeze(1)
-    area2 = (boxes2[..., 2] * boxes2[..., 3]).unsqueeze(0)
-    return inter / (area1 + area2 - inter + eps)
+    # Convert cxcywh -> xyxy
+    b1x1 = boxes1[..., 0] - boxes1[..., 2] / 2
+    b1y1 = boxes1[..., 1] - boxes1[..., 3] / 2
+    b1x2 = boxes1[..., 0] + boxes1[..., 2] / 2
+    b1y2 = boxes1[..., 1] + boxes1[..., 3] / 2
+    area1 = (b1x2 - b1x1).clamp(min=0) * (b1y2 - b1y1).clamp(min=0)
+
+    b2x1 = boxes2[..., 0] - boxes2[..., 2] / 2
+    b2y1 = boxes2[..., 1] - boxes2[..., 3] / 2
+    b2x2 = boxes2[..., 0] + boxes2[..., 2] / 2
+    b2y2 = boxes2[..., 1] + boxes2[..., 3] / 2
+    area2 = (b2x2 - b2x1).clamp(min=0) * (b2y2 - b2y1).clamp(min=0)
+
+    inter_x1 = torch.max(b1x1.unsqueeze(1), b2x1.unsqueeze(0))
+    inter_y1 = torch.max(b1y1.unsqueeze(1), b2y1.unsqueeze(0))
+    inter_x2 = torch.min(b1x2.unsqueeze(1), b2x2.unsqueeze(0))
+    inter_y2 = torch.min(b1y2.unsqueeze(1), b2y2.unsqueeze(0))
+    inter = (inter_x2 - inter_x1).clamp(min=0) * (inter_y2 - inter_y1).clamp(min=0)
+    return inter / (area1.unsqueeze(1) + area2.unsqueeze(0) - inter + eps)
 
 
 def compute_ap(precisions, recalls):
@@ -286,14 +299,25 @@ def validate(model, val_loader, device, num_classes=80, image_size=640, max_batc
         for k, (img_idx, det) in enumerate(cls_dets):
             best_iou = 0
             best_gt = -1
+            # det["boxes"] is xyxy normalized [0,1]; gt is (batch_idx, cls, cx, cy, w, h) normalized [0,1]
+            # Both in canvas-space, so convert xyxy -> cxcywh for IoU
+            det_boxes = det["boxes"].cpu()
+            det_cx = (det_boxes[:, 0] + det_boxes[:, 2]) / 2
+            det_cy = (det_boxes[:, 1] + det_boxes[:, 3]) / 2
+            det_w = det_boxes[:, 2] - det_boxes[:, 0]
+            det_h = det_boxes[:, 3] - det_boxes[:, 1]
+            det_cxcywh = torch.stack([det_cx, det_cy, det_w, det_h], dim=1)
+
             for gt_idx, (gt_img_idx, gt) in enumerate(cls_gts):
                 if gt_matched[gt_idx] or gt_img_idx != img_idx:
                     continue
-                iou = box_iou(det["boxes"].cpu(), gt[2:].unsqueeze(0))[0, 0].item()
+                # gt = (batch_idx, cls, cx, cy, w, h) normalized [0,1]
+                gt_cxcywh = gt[2:].unsqueeze(0)  # (1, 4) cxcywh
+                iou = box_iou(det_cxcywh, gt_cxcywh)[0, 0].item()
                 if iou > best_iou:
                     best_iou = iou
                     best_gt = gt_idx
-            if best_iou >= 0.5:
+            if best_iou >= 0.5 and best_gt >= 0:
                 tp[k] = 1
                 gt_matched[best_gt] = True
             else:
