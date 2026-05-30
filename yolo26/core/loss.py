@@ -314,30 +314,42 @@ class YOLOv26Loss(nn.Module):
                              (1 - gt_cls_tgt) * (1 - matched_prob).log()).mean()
                     o2o_cls_sum = o2o_cls_sum + bce
 
-                    # Box loss: Hungarian already aligns matched_reg[i] with lvl_tgt[i]
-                    decoded_dx = matched_reg[:, 0]
-                    decoded_dy = matched_reg[:, 1]
-                    decoded_dw = matched_reg[:, 2]
-                    decoded_dh = matched_reg[:, 3]
-
-                    # gt_cx[i], gt_cy[i] correspond to matched_reg[i]
-                    gt_cx = lvl_tgt[:, 2]
-                    gt_cy = lvl_tgt[:, 3]
-                    gt_w = lvl_tgt[:, 4]
-                    gt_h = lvl_tgt[:, 5]
-
+                    # Box loss: Hungarian aligns matched_reg[i] with lvl_tgt[i].
+                    # Use the SAME decode as the Hungarian cost function:
+                    #   decoded_cx = cell_cx + dx * (stride/image_size)  (normalized)
+                    #   decoded_w  = exp(dw) * (stride/image_size)       (normalized)
+                    # GT is already in normalized [0,1] space.
                     stride = strides[lvl]
+                    s_over_I = stride / image_size
+
+                    dx = matched_reg[:, 0]
+                    dy = matched_reg[:, 1]
+                    dw = matched_reg[:, 2]
+                    dh = matched_reg[:, 3]
+
+                    # Decode: same formula as Hungarian cost function
                     pred_cx_grid = (torch.arange(W, device=device, dtype=matched_reg.dtype) + 0.5) / W
                     pred_cy_grid = (torch.arange(H, device=device, dtype=matched_reg.dtype) + 0.5) / H
                     cy_g, cx_g = torch.meshgrid(pred_cy_grid, pred_cx_grid, indexing="ij")
                     cx_flat = cx_g.reshape(-1)
                     cy_flat = cy_g.reshape(-1)
 
+                    pred_cx = cx_flat[matched_idx] + dx * s_over_I
+                    pred_cy = cy_flat[matched_idx] + dy * s_over_I
+                    pred_w = torch.exp(dw.clamp(max=math.log(image_size * 2))) * s_over_I
+                    pred_h = torch.exp(dh.clamp(max=math.log(image_size * 2))) * s_over_I
+
+                    # GT is already in normalized [0,1] space
+                    gt_cx = lvl_tgt[:, 2]
+                    gt_cy = lvl_tgt[:, 3]
+                    gt_w = lvl_tgt[:, 4]
+                    gt_h = lvl_tgt[:, 5]
+
                     box_l = (
-                        (decoded_dx - (gt_cx - cx_flat[matched_idx]) * (image_size / stride)).abs().mean() +
-                        (decoded_dy - (gt_cy - cy_flat[matched_idx]) * (image_size / stride)).abs().mean() +
-                        (decoded_dw - torch.log(gt_w * image_size / stride).clamp(-7, 7)).abs().mean() +
-                        (decoded_dh - torch.log(gt_h * image_size / stride).clamp(-7, 7)).abs().mean()
+                        F.smooth_l1_loss(pred_cx, gt_cx, reduction="mean") +
+                        F.smooth_l1_loss(pred_cy, gt_cy, reduction="mean") +
+                        F.smooth_l1_loss(pred_w, gt_w, reduction="mean") +
+                        F.smooth_l1_loss(pred_h, gt_h, reduction="mean")
                     ) / 4.0
                     o2o_box_sum = o2o_box_sum + box_l
                     n_levels_with_matches += 1
