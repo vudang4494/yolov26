@@ -40,6 +40,12 @@ class YOLOv26Loss(nn.Module):
         total = freq.sum() + 1e-7
         freq = freq / total
         return 1.0 + self.alpha_prog * (1.0 - freq)
+        freq = torch.zeros(num_classes, device=device)
+        for cls in targets[:, 1].unique():
+            freq[int(cls)] = (targets[:, 1] == cls).sum().float()
+        total = freq.sum() + 1e-7
+        freq = freq / total
+        return 1.0 + self.alpha_prog * (1.0 - freq)
 
     def _stal_weight(self, gt_w, gt_h, image_size, stride):
         """
@@ -223,10 +229,12 @@ class YOLOv26Loss(nn.Module):
             cost_matrix[:, j] = cls_cost + 0.1 * box_cost
 
         cost_np = cost_matrix.detach().cpu().numpy()
-        pred_indices, gt_indices = linear_sum_assignment(cost_np)
-        matched_cls = cls_flat[pred_indices]
-        matched_reg = reg_decoded[pred_indices]
-        return matched_cls, matched_reg, torch.tensor(pred_indices, dtype=torch.long, device=reg_pred.device)
+        row_indices, col_indices = linear_sum_assignment(cost_np)
+        # row_indices[j] = GT matched to prediction row j
+        # col_indices[j] = prediction matched to GT column j (j=0..n_gt-1)
+        matched_cls = cls_flat[col_indices]     # (n_gt, nc)
+        matched_reg = reg_decoded[col_indices]  # (n_gt, 4)
+        return matched_cls, matched_reg, torch.tensor(col_indices, dtype=torch.long, device=reg_pred.device)
 
     def forward(self, o2m_preds, o2o_preds, targets, anchors, image_size=640):
         """
@@ -281,10 +289,9 @@ class YOLOv26Loss(nn.Module):
                 acc_box = acc_box + (lvl_box / num_levels)
 
             # O2O branch: Hungarian matching (Innovation #2)
-            # Find best level for each GT (highest resolution that fits)
-            o2o_cls_losses = torch.tensor(0.0, device=device)
-            o2o_box_losses = torch.tensor(0.0, device=device)
-            o2o_assigned = 0
+            o2o_cls_sum = torch.tensor(0.0, device=device)
+            o2o_box_sum = torch.tensor(0.0, device=device)
+            n_levels_with_matches = 0
 
             for lvl, pred in enumerate(o2o_preds):
                 H, W = feature_shapes[lvl]
@@ -298,40 +305,47 @@ class YOLOv26Loss(nn.Module):
                 )
 
                 if matched_cls.shape[0] > 0:
+                    # Safe BCE: use clamped sigmoid probabilities
+                    matched_prob = matched_cls.clamp(min=1e-7, max=1 - 1e-7)
                     gt_cls_tgt = F.one_hot(
                         lvl_tgt[:, 1].long(), num_classes=self.nc
                     ).float().to(device)
-                    bce = F.binary_cross_entropy_with_logits(
-                        matched_cls.log(), gt_cls_tgt, reduction="mean"
-                    )
-                    o2o_cls_losses = o2o_cls_losses + bce
+                    bce = -(gt_cls_tgt * matched_prob.log() +
+                             (1 - gt_cls_tgt) * (1 - matched_prob).log()).mean()
+                    o2o_cls_sum = o2o_cls_sum + bce
 
-                    # Decode matched predictions back to cxcywh
+                    # Box loss: Hungarian already aligns matched_reg[i] with lvl_tgt[i]
                     decoded_dx = matched_reg[:, 0]
                     decoded_dy = matched_reg[:, 1]
                     decoded_dw = matched_reg[:, 2]
                     decoded_dh = matched_reg[:, 3]
 
+                    # gt_cx[i], gt_cy[i] correspond to matched_reg[i]
                     gt_cx = lvl_tgt[:, 2]
                     gt_cy = lvl_tgt[:, 3]
                     gt_w = lvl_tgt[:, 4]
                     gt_h = lvl_tgt[:, 5]
 
-                    pred_cx = (torch.arange(W, device=device, dtype=matched_reg.dtype).unsqueeze(0) + 0.5) / W
-                    pred_cy = (torch.arange(H, device=device, dtype=matched_reg.dtype).unsqueeze(1) + 0.5) / H
-                    pred_cx = pred_cx.expand(H, W).reshape(-1)
-                    pred_cy = pred_cy.expand(H, W).reshape(-1)
+                    stride = strides[lvl]
+                    pred_cx_grid = (torch.arange(W, device=device, dtype=matched_reg.dtype) + 0.5) / W
+                    pred_cy_grid = (torch.arange(H, device=device, dtype=matched_reg.dtype) + 0.5) / H
+                    cy_g, cx_g = torch.meshgrid(pred_cy_grid, pred_cx_grid, indexing="ij")
+                    cx_flat = cx_g.reshape(-1)
+                    cy_flat = cy_g.reshape(-1)
 
-                    box_l = (decoded_dx - (gt_cx - pred_cx[matched_idx])).abs().mean() + \
-                            (decoded_dy - (gt_cy - pred_cy[matched_idx])).abs().mean() + \
-                            (decoded_dw - torch.log(gt_w * image_size / strides[lvl]).clamp(min=-7, max=7)).abs().mean() + \
-                            (decoded_dh - torch.log(gt_h * image_size / strides[lvl]).clamp(min=-7, max=7)).abs().mean()
-                    o2o_box_losses = o2o_box_losses + box_l / 4.0
-                    o2o_assigned += matched_cls.shape[0]
+                    box_l = (
+                        (decoded_dx - (gt_cx - cx_flat[matched_idx]) * (image_size / stride)).abs().mean() +
+                        (decoded_dy - (gt_cy - cy_flat[matched_idx]) * (image_size / stride)).abs().mean() +
+                        (decoded_dw - torch.log(gt_w * image_size / stride).clamp(-7, 7)).abs().mean() +
+                        (decoded_dh - torch.log(gt_h * image_size / stride).clamp(-7, 7)).abs().mean()
+                    ) / 4.0
+                    o2o_box_sum = o2o_box_sum + box_l
+                    n_levels_with_matches += 1
 
-            if o2o_assigned > 0:
-                acc_o2o_cls = acc_o2o_cls + (o2o_cls_losses / max(o2o_assigned, 1))
-                acc_o2o_box = acc_o2o_box + (o2o_box_losses / max(o2o_assigned, 1))
+            if n_levels_with_matches > 0:
+                # Average over levels with matches, then over batch
+                acc_o2o_cls = acc_o2o_cls + (o2o_cls_sum / n_levels_with_matches)
+                acc_o2o_box = acc_o2o_box + (o2o_box_sum / n_levels_with_matches)
 
         # Average over batch
         denom = max(batch_size, 1)

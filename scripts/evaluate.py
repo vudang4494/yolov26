@@ -17,13 +17,28 @@ from yolo26.core.model import YOLOv26Model
 
 
 def box_iou(boxes1, boxes2, eps=1e-7):
-    """IoU between two sets of cxcywh boxes."""
+    """IoU between two sets of boxes in cxcywh format."""
     if boxes1.shape[0] == 0 or boxes2.shape[0] == 0:
         return torch.zeros(boxes1.shape[0], boxes2.shape[0])
-    inter = torch.min(boxes1[..., 2:], boxes2[..., 2:]).clamp(min=0).prod(dim=-1)
-    area1 = (boxes1[..., 2] * boxes1[..., 3]).unsqueeze(1)
-    area2 = (boxes2[..., 2] * boxes2[..., 3]).unsqueeze(0)
-    return inter / (area1 + area2 - inter + eps)
+    # Convert cxcywh -> xyxy
+    b1x1 = boxes1[..., 0] - boxes1[..., 2] / 2
+    b1y1 = boxes1[..., 1] - boxes1[..., 3] / 2
+    b1x2 = boxes1[..., 0] + boxes1[..., 2] / 2
+    b1y2 = boxes1[..., 1] + boxes1[..., 3] / 2
+    area1 = (b1x2 - b1x1).clamp(min=0) * (b1y2 - b1y1).clamp(min=0)
+
+    b2x1 = boxes2[..., 0] - boxes2[..., 2] / 2
+    b2y1 = boxes2[..., 1] - boxes2[..., 3] / 2
+    b2x2 = boxes2[..., 0] + boxes2[..., 2] / 2
+    b2y2 = boxes2[..., 1] + boxes2[..., 3] / 2
+    area2 = (b2x2 - b2x1).clamp(min=0) * (b2y2 - b2y1).clamp(min=0)
+
+    inter_x1 = torch.max(b1x1.unsqueeze(1), b2x1.unsqueeze(0))
+    inter_y1 = torch.max(b1y1.unsqueeze(1), b2y1.unsqueeze(0))
+    inter_x2 = torch.min(b1x2.unsqueeze(1), b2x2.unsqueeze(0))
+    inter_y2 = torch.min(b1y2.unsqueeze(1), b2y2.unsqueeze(0))
+    inter = (inter_x2 - inter_x1).clamp(min=0) * (inter_y2 - inter_y1).clamp(min=0)
+    return inter / (area1.unsqueeze(1) + area2.unsqueeze(0) - inter + eps)
 
 
 def compute_ap(precisions, recalls):

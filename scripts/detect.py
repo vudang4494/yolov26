@@ -9,7 +9,6 @@ import time
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -124,9 +123,6 @@ def main():
     args = parser.parse_args()
 
     device = args.device if torch.backends.mps.is_available() and args.device == "mps" else "cpu"
-    if device == "mps" and not torch.backends.mps.is_available():
-        print("MPS not available, falling back to CPU")
-        device = "cpu"
 
     print(f"Building YOLOv26-{args.model.upper()} on {device}...")
     model = YOLOv26Model(

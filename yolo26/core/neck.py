@@ -31,9 +31,11 @@ class YOLOv26Neck(nn.Module):
         # fused P3 -> downsample -> fuse with fused P4
         self.downsample4 = Conv(out_ch, out_ch, 3, 2, act=True)
         self.c3k5 = RefinedC3k2(out_ch + out_ch, out_ch, n=2, shortcut=False)
-        # fused P4 -> downsample -> fuse with P5
+        # fused P4 -> downsample -> fuse with reduced P5
         self.downsample5 = Conv(out_ch, out_ch, 3, 2, act=True)
-        self.c3k6 = RefinedC3k2(out_ch + c5, out_ch, n=2, shortcut=False)
+        # Reduce P5 to neck_out_ch so PAN concatenation is (out_ch + out_ch)
+        self.reduce5_pan = Conv(c5, out_ch, 1, 1, act=True)
+        self.c3k6 = RefinedC3k2(out_ch + out_ch, out_ch, n=2, shortcut=False)
 
     def forward(self, features):
         p3, p4, p5 = features
@@ -47,6 +49,6 @@ class YOLOv26Neck(nn.Module):
 
         # ── PAN: Bottom-up ─────────────────────────────────────────────
         pan4 = self.c3k5(torch.cat([self.downsample4(fpn3), fpn4], 1))
-        pan5 = self.c3k6(torch.cat([self.downsample5(pan4), p5], 1))
+        pan5 = self.c3k6(torch.cat([self.downsample5(pan4), self.reduce5_pan(p5)], 1))
 
         return fpn3, pan4, pan5

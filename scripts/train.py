@@ -12,7 +12,6 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import yaml
 from tqdm import tqdm
 
@@ -290,7 +289,7 @@ def validate(model, val_loader, device, num_classes=80, image_size=640, max_batc
             for gt_idx, (gt_img_idx, gt) in enumerate(cls_gts):
                 if gt_matched[gt_idx] or gt_img_idx != img_idx:
                     continue
-                iou = box_iou(det["boxes"].cpu(), gt[:, 2:6])[0, 0].item()
+                iou = box_iou(det["boxes"].cpu(), gt[2:].unsqueeze(0))[0, 0].item()
                 if iou > best_iou:
                     best_iou = iou
                     best_gt = gt_idx
