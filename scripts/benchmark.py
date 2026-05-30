@@ -63,7 +63,10 @@ def benchmark_scale(
             _ = model(x)
 
     if device in ("mps", "cuda"):
-        getattr(torch, device).synchronize()
+        if device == "mps":
+            torch.mps.synchronize()
+        else:
+            torch.cuda.synchronize()
 
     clear_cache(device)
 

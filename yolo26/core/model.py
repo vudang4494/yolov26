@@ -241,3 +241,105 @@ def build_yolo26(scale="n", num_classes=80, image_size=640, **kwargs):
     """Convenience factory function."""
     return YOLOv26Model(num_classes=num_classes, scale=scale,
                        image_size=image_size, **kwargs)
+
+
+def load_pretrained_weights(model, url=None, path=None, verbose=True):
+    """
+    Load Ultralytics YOLO26 pretrained weights into our model via shape matching.
+
+    Strategy: For each of our layers, find official weights with IDENTICAL shape.
+    This transfers ~60-80% of weights when architectures are similar.
+    Non-matching layers stay randomly initialized (fine for training).
+
+    Args:
+        model: Our YOLOv26Model instance
+        url: Optional URL to pretrained weights (.pt file)
+        path: Optional local path to .pt file
+        verbose: Print loading stats
+
+    Returns:
+        (loaded_count, skipped_count)
+    """
+    import os, urllib.request
+
+    if path is None:
+        path = "yolo26n.pt"
+    if url is None:
+        url = "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n.pt"
+
+    # Download if needed
+    if not os.path.exists(path):
+        if verbose:
+            print(f"Downloading pretrained weights from {url}...")
+        urllib.request.urlretrieve(url, path)
+        if verbose:
+            print(f"Saved to {path}")
+
+    # Load official weights
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+
+    # Navigate to state dict
+    official_sd = {}
+    if isinstance(ckpt, dict):
+        if "model" in ckpt and hasattr(ckpt["model"], "state_dict"):
+            official_sd = ckpt["model"].state_dict()
+        elif "model" in ckpt and isinstance(ckpt["model"], dict):
+            official_sd = {k: v for k, v in ckpt["model"].items()
+                          if isinstance(v, torch.Tensor)}
+        elif "state_dict" in ckpt:
+            official_sd = ckpt["state_dict"]
+        else:
+            official_sd = {k: v for k, v in ckpt.items()
+                          if isinstance(v, torch.Tensor)}
+    elif hasattr(ckpt, "state_dict"):
+        official_sd = ckpt.state_dict()
+
+    # Strip 'model.' prefix if present (Ultralytics format)
+    official_sd_clean = {}
+    for k, v in official_sd.items():
+        clean_key = k
+        if k.startswith("model."):
+            clean_key = k[len("model."):]
+        if clean_key not in official_sd_clean:
+            official_sd_clean[clean_key] = v
+
+    # Index official weights by shape
+    shape_map = {}
+    for k, v in official_sd_clean.items():
+        sk = str(tuple(v.shape))
+        if sk not in shape_map:
+            shape_map[sk] = []
+        shape_map[sk].append((k, v))
+
+    # Match by shape
+    ours_sd = model.state_dict()
+    matched_official_keys = set()
+    loaded_keys = []
+    skipped_keys = []
+
+    for our_key, our_tensor in ours_sd.items():
+        sk = str(tuple(our_tensor.shape))
+        if sk in shape_map:
+            for ok, ov in shape_map[sk]:
+                if ok not in matched_official_keys:
+                    ours_sd[our_key] = ov.clone()
+                    matched_official_keys.add(ok)
+                    loaded_keys.append((our_key, ok))
+                    break
+            else:
+                skipped_keys.append(our_key)
+        else:
+            skipped_keys.append(our_key)
+
+    model.load_state_dict(ours_sd, strict=False)
+
+    if verbose:
+        print(f"Pretrained weights: {len(loaded_keys)}/{len(ours_sd)} layers loaded "
+              f"({100*len(loaded_keys)/len(ours_sd):.0f}%), "
+              f"{len(skipped_keys)} unmatched (random init)")
+        if loaded_keys and verbose >= 2:
+            print("  Sample matches:")
+            for our, off in loaded_keys[:5]:
+                print(f"    {our} <- {off}")
+
+    return len(loaded_keys), len(skipped_keys)
