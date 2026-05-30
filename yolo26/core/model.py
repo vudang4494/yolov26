@@ -183,35 +183,32 @@ class YOLOv26Model(nn.Module):
     def _forward_head(self, features):
         return self.head(features)
 
-    def forward(self, x, targets=None):
+    def forward(self, x):
         """
-        Forward pass.
-
-        Args:
-            x: Input tensor (B, 3, H, W)
-            targets: Optional training targets (N, 6) [batch_idx, cls, cx, cy, w, h]
-        Returns:
-            If training: (o2m_preds, o2o_preds)
-            If inference: list of dicts with 'boxes', 'scores', 'labels'
+        Forward pass — pure inference from image to raw predictions.
+        For training: use model.backbone/neck/head directly.
         """
-        if not self.training:
-            with torch.no_grad():
-                with torch.inference_mode():
-                    return self._forward_impl(x)
-        return self._forward_impl(x)
-
-    def _forward_impl(self, x):
         backbone_out = self._forward_backbone(x)
         neck_out = self._forward_neck(backbone_out)
         o2m_out, o2o_out = self._forward_head(neck_out)
+        return o2m_out, o2o_out
 
+    def predict(self, x, targets=None):
+        """Inference: forward + postprocess. Returns detection results."""
         if self.training:
-            return o2m_out, o2o_out
+            return self.forward(x)
+        with torch.no_grad():
+            with torch.inference_mode():
+                o2m_out, o2o_out = self.forward(x)
+                return self.postprocess(
+                    o2o_out, self.anchor_list,
+                    self.stride_tensor.tolist(),
+                    image_size=self.image_size, mode="o2o"
+                )
 
-        results = self.postprocess(o2o_out, self.anchor_list,
-                                   self.stride_tensor.tolist(),
-                                   image_size=self.image_size, mode="o2o")
-        return results
+    def _forward_impl(self, x):
+        """Legacy compatibility — calls predict()."""
+        return self.predict(x)
 
     def info(self, verbose=False):
         """Print model info."""

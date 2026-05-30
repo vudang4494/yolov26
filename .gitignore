@@ -73,6 +73,7 @@ results/
 
 # ONNX export
 *.onnx
+*.onnx.data
 *.mlmodel
 *.tflite
 

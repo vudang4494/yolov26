@@ -57,10 +57,13 @@ def benchmark_scale(
 
     clear_cache(device)
 
-    # Warmup — critical for accurate measurement
-    with torch.no_grad():
-        for _ in range(warmup):
-            _ = model(x)
+        # Warmup — critical for accurate measurement
+        with torch.no_grad():
+            for _ in range(warmup):
+                if hasattr(model, 'predict'):
+                    _ = model.predict(x)
+                else:
+                    _ = model(x)
 
     if device in ("mps", "cuda"):
         if device == "mps":
@@ -75,7 +78,10 @@ def benchmark_scale(
     with torch.no_grad():
         for _ in range(runs):
             t0 = time.perf_counter()
-            _ = model(x)
+            if hasattr(model, 'predict'):
+                _ = model.predict(x)
+            else:
+                _ = model(x)
             if device == "cuda":
                 torch.cuda.synchronize()
             elif device == "mps":
